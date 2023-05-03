@@ -1,28 +1,18 @@
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Azure.Storage.Sas;
 using Microsoft.Azure.Batch;
 using Microsoft.Azure.Batch.Auth;
 using Microsoft.Azure.Batch.Common;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text.RegularExpressions;
 
-private static CloudBlobClient CreateCloudBlobClient(string storageConnectionString)
-{
-    // Retrieve the storage account
-    CloudStorageAccount storageAccount = CloudStorageAccount.Parse(storageConnectionString);
-
-    // Create the blob client
-    CloudBlobClient blobClient = storageAccount.CreateCloudBlobClient();
-
-    return blobClient;
-}
-
 public static void Run(Stream myBlob, string name, ILogger log)
 {
-    BatchSharedKeyCredentials cred = new BatchSharedKeyCredentials("<YOUR_BATCH_URL_HERE>", "<YOUR_BATCH_ACCOUNT_HERE>", "<YOUR_BATCH_PRIMARY_KEY_HERE>");
+    BatchSharedKeyCredentials cred = new BatchSharedKeyCredentials("<YOUR_BATCH_ACCOUNT_ENDPOINT_HERE>", "<YOUR_BATCH_ACCOUNT_HERE>", "<YOUR_BATCH_PRIMARY_KEY_HERE>");
     const string JobId = "ocr-job";
     const string InputContainerConnectionString = "<YOUR_STORAGE_ACCOUNT_CONNECTION_STRING>";
     const string inputContainerName = "input";
@@ -36,24 +26,42 @@ public static void Run(Stream myBlob, string name, ILogger log)
 
 
         // Create the blob client, for use in obtaining references to blob storage containers
-        CloudBlobClient blobClient = CreateCloudBlobClient(InputContainerConnectionString);
+        var blobServiceClient = new BlobServiceClient(InputContainerConnectionString);
 
         // Use the blob client to create the input container in Azure Storage 
-        CloudBlobContainer container = blobClient.GetContainerReference(inputContainerName);
+        var containerClient = blobServiceClient.GetBlobContainerClient(inputContainerName);
+        containerClient.CreateIfNotExistsAsync().Wait();
+
+        var blobClient = containerClient.GetBlobClient(name);
 
         List<ResourceFile> inputFiles = new List<ResourceFile>();
-        
-        SharedAccessBlobPolicy sasConstraints = new SharedAccessBlobPolicy
+        // Check whether this BlobContainerClient object has been authorized with Shared Key.
+        string blobSasUrl = null;
+        if (containerClient.CanGenerateSasUri)
         {
-            SharedAccessExpiryTime = DateTime.UtcNow.AddHours(2),
-            Permissions = SharedAccessBlobPermissions.Read | SharedAccessBlobPermissions.List
-        };
-        
-        string sasToken = container.GetSharedAccessSignature(sasConstraints);
-        string containerSasUrl = String.Format("{0}{1}", container.Uri, sasToken);
-        inputFiles.Add(ResourceFile.FromStorageContainerUrl(containerSasUrl));
+            // Create a SAS token that's valid for one hour.
+            BlobSasBuilder sasBuilder = new BlobSasBuilder()
+            {
+                BlobContainerName = containerClient.Name,
+                BlobName = blobClient.Name,
+                Resource = "b"
+            };
+
+            sasBuilder.ExpiresOn = DateTimeOffset.UtcNow.AddHours(1);
+            sasBuilder.SetPermissions(BlobContainerSasPermissions.Read);
+
+            blobSasUrl = blobClient.GenerateSasUri(sasBuilder).ToString();
+            log.LogInformation("SAS URI for blob is: {0}", blobSasUrl);
+        }
+        else
+        {
+            log.LogInformation(@"BlobContainerClient must be authorized with Shared Key 
+                          credentials to create a service SAS.");
+            return;
+        }
+
+        inputFiles.Add(ResourceFile.FromUrl(blobSasUrl, blobClient.Name));
         log.LogInformation($"Adding \"{name}\" as a resource file...");
-        
 
         List<CloudTask> tasks = new List<CloudTask>();
 
@@ -65,12 +73,11 @@ public static void Run(Stream myBlob, string name, ILogger log)
         log.LogInformation($"Name of output PDF file: \"{outputPdfFilename}\"");
         string uniqueIdentifier = Regex.Replace(Convert.ToBase64String(Guid.NewGuid().ToByteArray()), "[/+=]", "");
         string taskId = String.Format(inputFilename.Replace(".", string.Empty) + "-" + uniqueIdentifier);
-        
+
         string taskCommandLine = String.Format("/bin/bash -c \"sudo -S ocrmypdf --sidecar {0} {1} {2}\"", outputTextFilename, name, outputPdfFilename);
 
         CloudTask task = new CloudTask(taskId, taskCommandLine);
         task.UserIdentity = new UserIdentity(new AutoUserSpecification(elevationLevel: ElevationLevel.Admin, scope: AutoUserScope.Task));
-
 
         List<OutputFile> outputFileList = new List<OutputFile>();
         OutputFileBlobContainerDestination outputContainer = new OutputFileBlobContainerDestination(OutputContainerSAS);
